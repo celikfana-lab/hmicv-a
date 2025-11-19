@@ -52,21 +52,9 @@ struct FrameIndexEntry {
 struct FastPlayerState {
     bool playing = false;
     bool has_audio = false;
-    bool enable_audio = true;  // 🎵 NEW: User choice for audio!!
-    bool max_fps_mode = false; // 🔥 NEW: CHAOS MODE!!
-    int render_every_n_frames = 1; // 🚀 Skip screen updates for ULTIMATE SPEED!!
     int current_frame = 0;
-    std::atomic<int64_t> target_audio_sample{0};
-    int64_t audio_sample_pos = 0;
-    std::chrono::high_resolution_clock::time_point start_time;
-    double frame_duration_ms = 0;
-    double samples_per_frame = 0;
     std::atomic<bool> quit{false};
     SDL_AudioDeviceID audio_device = 0;
-    
-    // 📊 FPS TRACKING FOR MAX MODE
-    int frames_rendered = 0;
-    std::chrono::high_resolution_clock::time_point fps_timer;
     
     // 🔥 MEMORY-MAPPED FILE DATA!!
     void* mapped_data = nullptr;
@@ -82,38 +70,34 @@ struct FastPlayerState {
     // 🎨 FRAME CACHE (for decompressed frames if needed)
     std::vector<RGBA*> frame_cache;
     std::vector<bool> frame_cached;
+    
+    // 🎵 AUDIO TIMING - SMOOTH AND SYNCED!!
+    std::atomic<int64_t> audio_frame_position{0}; // Which frame audio is playing
+    double samples_per_frame = 0;
+    int64_t audio_sample_index = 0;
 };
 
 FastPlayerState player;
 
-// 🎵 AUDIO CALLBACK - ULTRA FAST DIRECT MEMORY ACCESS!!
+// 🎵 AUDIO CALLBACK - IMPROVED SMOOTH PLAYBACK!!
 void audio_callback(void* userdata, Uint8* stream, int len) {
     memset(stream, 0, len);
     
-    if (!player.playing || !player.has_audio || !player.audio_data || !player.enable_audio) {
+    if (!player.playing || !player.has_audio || !player.audio_data) {
         return;
     }
     
     float* output = (float*)stream;
     int samples_needed = len / sizeof(float) / player.header->audio_channels;
     
-    // 🎯 SYNC TO TARGET SAMPLE POSITION FROM VIDEO FRAME!!
-    int64_t target = player.target_audio_sample.load();
-    int64_t drift = target - player.audio_sample_pos;
-    
-    // 🔥 RESYNC if drift is too large
-    if (abs(drift) > player.header->audio_sample_rate / 10) {
-        player.audio_sample_pos = target;
-    }
-    
-    // 💨 MEMCPY DIRECT FROM MAPPED MEMORY - NO PARSING!!
+    // 💨 SMOOTH CONTINUOUS PLAYBACK - NO JUMPING!!
     for (int i = 0; i < samples_needed; i++) {
-        if (player.audio_sample_pos >= 0 && 
-            player.audio_sample_pos < (int64_t)player.header->audio_samples) {
+        if (player.audio_sample_index >= 0 && 
+            player.audio_sample_index < (int64_t)player.header->audio_samples) {
             
             // 🔥 DIRECT MEMORY ACCESS - INSTANT!!
             for (int ch = 0; ch < player.header->audio_channels; ch++) {
-                int64_t sample_idx = player.audio_sample_pos * player.header->audio_channels + ch;
+                int64_t sample_idx = player.audio_sample_index * player.header->audio_channels + ch;
                 output[i * player.header->audio_channels + ch] = player.audio_data[sample_idx];
             }
         } else {
@@ -122,11 +106,17 @@ void audio_callback(void* userdata, Uint8* stream, int len) {
             }
         }
         
-        player.audio_sample_pos++;
+        player.audio_sample_index++;
+        
+        // Update which frame audio is at
+        if (player.samples_per_frame > 0) {
+            player.audio_frame_position.store((int64_t)(player.audio_sample_index / player.samples_per_frame));
+        }
         
         // Loop if needed
-        if (player.audio_sample_pos >= (int64_t)player.header->audio_samples) {
-            player.audio_sample_pos = 0;
+        if (player.audio_sample_index >= (int64_t)player.header->audio_samples) {
+            player.audio_sample_index = 0;
+            player.audio_frame_position.store(0);
         }
     }
 }
@@ -179,7 +169,7 @@ bool load_hmicfast(const std::string& path) {
     
     std::cout << "🎬 VIDEO INFO:\n";
     std::cout << "   📺 Resolution: " << player.header->width << "x" << player.header->height << "\n";
-    std::cout << "   🎞️  FPS (from file): " << player.header->fps << "\n";
+    std::cout << "   🎞️  FPS: " << player.header->fps << "\n";
     std::cout << "   📊 Total frames: " << player.header->total_frames << "\n";
     std::cout << "   💾 Compression: " << (player.header->compressed ? "Zstd" : "None (RAW)") << "\n";
     
@@ -193,12 +183,9 @@ bool load_hmicfast(const std::string& path) {
     
     std::cout << "✅ Frame index mapped!! " << player.header->total_frames << " frames ready\n";
     
-    // Setup timing
-    player.frame_duration_ms = 1000.0 / player.header->fps;
-    
     // 🎵 SETUP AUDIO IF PRESENT
     if (player.header->has_audio) {
-        std::cout << "\n🎵 AUDIO DETECTED IN FILE:\n";
+        std::cout << "\n🎵 AUDIO INFO:\n";
         std::cout << "   🎧 Sample rate: " << player.header->audio_sample_rate << "Hz\n";
         std::cout << "   📊 Channels: " << (int)player.header->audio_channels << "\n";
         std::cout << "   🎼 Total samples: " << player.header->audio_samples << "\n";
@@ -268,27 +255,6 @@ RGBA* get_frame_data(int frame_idx) {
     return player.frame_cache[frame_idx];
 }
 
-// 🎨 RENDER FRAME - ULTRA FAST MEMCPY!!
-void render_frame(SDL_Surface* surface, int frame_idx) {
-    RGBA* frame_data = get_frame_data(frame_idx);
-    if (!frame_data) return;
-    
-    // 🔥🔥🔥 DIRECT MEMCPY TO SCREEN!! NO PARSING!! ⚡⚡⚡
-    SDL_LockSurface(surface);
-    
-    // Convert RGBA to surface format (still super fast!!)
-    Uint32* pixels = (Uint32*)surface->pixels;
-    for (int i = 0; i < player.header->width * player.header->height; i++) {
-        pixels[i] = SDL_MapRGBA(surface->format, 
-                                frame_data[i].r, 
-                                frame_data[i].g, 
-                                frame_data[i].b, 
-                                frame_data[i].a);
-    }
-    
-    SDL_UnlockSurface(surface);
-}
-
 // 🧹 CLEANUP
 void cleanup() {
     std::cout << "\n🧹 Cleaning up...\n";
@@ -316,9 +282,9 @@ void cleanup() {
 }
 
 int main(int argc, char* argv[]) {
-    std::cout << "⚡⚡⚡ HMIC-FAST ULTRA CHAOS PLAYER ⚡⚡⚡\n";
-    std::cout << "🔥 MEMORY-MAPPED ZERO-COPY INSTANT PLAYBACK!! 🔥\n";
-    std::cout << "💨 NO PARSING!! JUST PURE SPEED!! 💨\n\n";
+    std::cout << "⚡⚡⚡ HMIC-FAST GPU ACCELERATED PLAYER ⚡⚡⚡\n";
+    std::cout << "🔥 HARDWARE RENDERING + ZERO-COPY PLAYBACK!! 🔥\n";
+    std::cout << "💨 BUTTERY SMOOTH 60FPS!! 💨\n\n";
     
     std::string file_path;
     if (argc > 1) {
@@ -333,86 +299,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    // 🎵 ASK ABOUT AUDIO!!
-    if (player.header->has_audio) {
-        std::cout << "\n🎵 This file has audio!! Do you want to enable it?\n";
-        std::cout << "   (Note: audio may sound CURSED in max FPS mode lol)\n";
-        std::cout << "   Enable audio? (y/n): ";
-        std::string audio_choice;
-        std::getline(std::cin, audio_choice);
-        player.enable_audio = (audio_choice == "y" || audio_choice == "Y" || 
-                               audio_choice == "yes" || audio_choice == "YES");
-        
-        if (player.enable_audio) {
-            std::cout << "✅ Audio ENABLED!! 🔊\n";
-        } else {
-            std::cout << "🔇 Audio DISABLED!! Silent mode activated\n";
-        }
-    }
-    
-    // 🔥 ASK ABOUT MAX FPS MODE!!
-    std::cout << "\n🚀🚀🚀 PLAYBACK MODE SELECTION 🚀🚀🚀\n";
-    std::cout << "Choose your destiny:\n";
-    std::cout << "   [1] Normal mode (" << player.header->fps << " FPS - respects original timing)\n";
-    std::cout << "   [2] FAST MODE (render every frame, ~500-1000 FPS)\n";
-    std::cout << "   [3] LUDICROUS MODE (render every 5 frames, 2000-5000 FPS!! 🔥🔥🔥)\n";
-    std::cout << "   [4] PLAID MODE (render every 10 frames, 5000-10000 FPS!! 💥💥💥)\n";
-    std::cout << "   [5] TRANSCENDENT MODE (render every 30 frames, YOUR CPU WILL MELT!! ☢️☢️☢️)\n";
-    std::cout << "\nYour choice (1-5): ";
-    std::string mode_choice;
-    std::getline(std::cin, mode_choice);
-    
-    if (mode_choice == "1") {
-        player.max_fps_mode = false;
-        player.render_every_n_frames = 1;
-        std::cout << "\n✅ Normal mode selected (" << player.header->fps << " FPS)\n";
-        std::cout << "🎬 Playing at original speed\n\n";
-    } else if (mode_choice == "2") {
-        player.max_fps_mode = true;
-        player.render_every_n_frames = 1;
-        std::cout << "\n💥 FAST MODE ACTIVATED!! 💥\n";
-        std::cout << "🔥 Rendering every frame!! 🔥\n\n";
-    } else if (mode_choice == "3") {
-        player.max_fps_mode = true;
-        player.render_every_n_frames = 5;
-        std::cout << "\n💥💥 LUDICROUS MODE ACTIVATED!! 💥💥\n";
-        std::cout << "🔥🔥 Screen updates every 5 frames!! FRAMES GO BRRRRR!! 🔥🔥\n\n";
-    } else if (mode_choice == "4") {
-        player.max_fps_mode = true;
-        player.render_every_n_frames = 10;
-        std::cout << "\n💥💥💥 PLAID MODE ACTIVATED!! 💥💥💥\n";
-        std::cout << "🔥🔥🔥 Screen updates every 10 frames!! ABSOLUTE CHAOS!! 🔥🔥🔥\n\n";
-    } else {
-        player.max_fps_mode = true;
-        player.render_every_n_frames = 30;
-        std::cout << "\n☢️☢️☢️ TRANSCENDENT MODE ACTIVATED!! ☢️☢️☢️\n";
-        std::cout << "🔥🔥🔥🔥 Screen updates every 30 frames!! 🔥🔥🔥🔥\n";
-        std::cout << "⚠️⚠️⚠️ YOUR COMPUTER IS NOW A SPACESHIP!! ⚠️⚠️⚠️\n\n";
-    }
-    
-    if (player.max_fps_mode) {
-        std::cout << "⚡ WE'RE GOING FULL SEND!! NO BRAKES!! ⚡\n";
-        std::cout << "🎢 STRAP IN!! THIS IS GONNA BE WILD!! 🎢\n\n";
-        
-        if (player.enable_audio) {
-            std::cout << "⚠️  WARNING: Audio sync will be... interesting 😅\n\n";
-        }
-    }
-    
-    // 🎮 INITIALIZE SDL
-    std::cout << "🎮 Initializing SDL2...\n";
+    // 🎮 INITIALIZE SDL WITH HARDWARE ACCELERATION!!
+    std::cout << "\n🎮 Initializing SDL2 with GPU acceleration...\n";
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
         std::cerr << "❌ SDL Init failed: " << SDL_GetError() << "\n";
         cleanup();
         return 1;
     }
     
-    std::string window_title = player.max_fps_mode ? 
-        "HMIC-FAST Player ⚡ - MAXIMUM CHAOS MODE!! 🔥🔥🔥" :
-        "HMIC-FAST Player ⚡ - Normal Mode";
-    
+    // 🚀 CREATE WINDOW
     SDL_Window* window = SDL_CreateWindow(
-        window_title.c_str(),
+        "HMIC-FAST Player ⚡ - GPU TURBO MODE!!",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         player.header->width, player.header->height,
         SDL_WINDOW_SHOWN
@@ -425,28 +322,69 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    SDL_Surface* screen_surface = SDL_GetWindowSurface(window);
+    // 🔥🔥🔥 CREATE HARDWARE ACCELERATED RENDERER!! 🔥🔥🔥
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, 
+        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     
-    // 🎵 SETUP AUDIO (if enabled)
-    if (player.has_audio && player.enable_audio) {
-        std::cout << "🎵 Setting up audio...\n";
+    if (!renderer) {
+        std::cerr << "⚠️  Hardware acceleration failed, trying software...\n";
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+        if (!renderer) {
+            std::cerr << "❌ Renderer creation failed: " << SDL_GetError() << "\n";
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            cleanup();
+            return 1;
+        }
+    } else {
+        std::cout << "✅ GPU HARDWARE ACCELERATION ENABLED!! 🚀🚀🚀\n";
+    }
+    
+    // Get renderer info
+    SDL_RendererInfo info;
+    SDL_GetRendererInfo(renderer, &info);
+    std::cout << "🎨 Renderer: " << info.name << "\n";
+    std::cout << "   Hardware accelerated: " << (info.flags & SDL_RENDERER_ACCELERATED ? "YES ✅" : "NO") << "\n";
+    std::cout << "   VSync enabled: " << (info.flags & SDL_RENDERER_PRESENTVSYNC ? "YES ✅" : "NO") << "\n";
+    
+    // 🎨 CREATE STREAMING TEXTURE FOR ULTRA-FAST GPU UPLOADS!!
+    SDL_Texture* texture = SDL_CreateTexture(renderer,
+        SDL_PIXELFORMAT_RGBA32,
+        SDL_TEXTUREACCESS_STREAMING,
+        player.header->width,
+        player.header->height);
+    
+    if (!texture) {
+        std::cerr << "❌ Texture creation failed: " << SDL_GetError() << "\n";
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        cleanup();
+        return 1;
+    }
+    
+    std::cout << "✅ Streaming texture created!! GPU READY!! 💚\n";
+    
+    // 🎵 SETUP AUDIO
+    if (player.has_audio) {
+        std::cout << "\n🎵 Setting up audio...\n";
         
         SDL_AudioSpec want, have;
         SDL_zero(want);
         want.freq = player.header->audio_sample_rate;
         want.format = AUDIO_F32SYS;
         want.channels = player.header->audio_channels;
-        want.samples = 512;
+        want.samples = 1024; // Slightly larger buffer for stability
         want.callback = audio_callback;
         
         player.audio_device = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
         if (player.audio_device == 0) {
             std::cerr << "⚠️ Audio setup failed: " << SDL_GetError() << "\n";
             player.has_audio = false;
-            player.enable_audio = false;
         } else {
             std::cout << "✅ Audio device opened!!\n";
-            SDL_PauseAudioDevice(player.audio_device, 0);
+            std::cout << "   Buffer size: " << have.samples << " samples\n";
+            SDL_PauseAudioDevice(player.audio_device, 0); // Start audio
         }
     }
     
@@ -461,13 +399,11 @@ int main(int argc, char* argv[]) {
     std::cout << "   ESC - Quit\n\n";
     
     player.playing = true;
-    player.start_time = std::chrono::high_resolution_clock::now();
-    player.fps_timer = std::chrono::high_resolution_clock::now();
     
     // 🔥 PRELOAD FIRST FEW FRAMES IF COMPRESSED
     if (player.header->compressed) {
-        std::cout << "🚀 Preloading first 10 frames...\n";
-        for (int i = 0; i < std::min(10, (int)player.header->total_frames); i++) {
+        std::cout << "🚀 Preloading first 30 frames...\n";
+        for (int i = 0; i < std::min(30, (int)player.header->total_frames); i++) {
             get_frame_data(i);
         }
         std::cout << "✅ Preload complete!\n\n";
@@ -475,9 +411,9 @@ int main(int argc, char* argv[]) {
     
     std::cout << "▶️  PLAYING!! 🔥🔥🔥\n\n";
     
-    // 🎬 MAIN LOOP - ULTRA OPTIMIZED!!
+    // 🎬 MAIN LOOP - GPU ACCELERATED SMOOTH AS BUTTER!!
     SDL_Event event;
-    int last_frame = -1;
+    int last_rendered_frame = -1;
     
     while (!player.quit) {
         // Handle events
@@ -489,26 +425,20 @@ int main(int argc, char* argv[]) {
                 switch (event.key.keysym.sym) {
                     case SDLK_SPACE: {
                         player.playing = !player.playing;
-                        if (player.playing) {
-                            auto now = std::chrono::high_resolution_clock::now();
-                            if (!player.max_fps_mode) {
-                                double elapsed_frames = player.current_frame * player.frame_duration_ms;
-                                player.start_time = now - std::chrono::milliseconds((int)elapsed_frames);
-                            }
-                        }
                         std::cout << (player.playing ? "▶️  PLAY" : "⏸️  PAUSE") << "\n";
+                        if (!player.playing && player.has_audio) {
+                            SDL_PauseAudioDevice(player.audio_device, 1);
+                        } else if (player.playing && player.has_audio) {
+                            SDL_PauseAudioDevice(player.audio_device, 0);
+                        }
                         break;
                     }
                     
                     case SDLK_LEFT: {
                         player.current_frame = std::max(0, player.current_frame - 1);
-                        int64_t target_sample = (int64_t)(player.current_frame * player.samples_per_frame);
-                        player.target_audio_sample.store(target_sample);
-                        
-                        if (!player.max_fps_mode) {
-                            auto now = std::chrono::high_resolution_clock::now();
-                            double elapsed_frames = player.current_frame * player.frame_duration_ms;
-                            player.start_time = now - std::chrono::milliseconds((int)elapsed_frames);
+                        if (player.has_audio) {
+                            player.audio_sample_index = (int64_t)(player.current_frame * player.samples_per_frame);
+                            player.audio_frame_position.store(player.current_frame);
                         }
                         break;
                     }
@@ -516,13 +446,9 @@ int main(int argc, char* argv[]) {
                     case SDLK_RIGHT: {
                         player.current_frame = std::min((int)player.header->total_frames - 1, 
                                                         player.current_frame + 1);
-                        int64_t target_sample = (int64_t)(player.current_frame * player.samples_per_frame);
-                        player.target_audio_sample.store(target_sample);
-                        
-                        if (!player.max_fps_mode) {
-                            auto now = std::chrono::high_resolution_clock::now();
-                            double elapsed_frames = player.current_frame * player.frame_duration_ms;
-                            player.start_time = now - std::chrono::milliseconds((int)elapsed_frames);
+                        if (player.has_audio) {
+                            player.audio_sample_index = (int64_t)(player.current_frame * player.samples_per_frame);
+                            player.audio_frame_position.store(player.current_frame);
                         }
                         break;
                     }
@@ -530,49 +456,39 @@ int main(int argc, char* argv[]) {
                     case SDLK_UP: {
                         player.current_frame = std::min((int)player.header->total_frames - 1, 
                                                         player.current_frame + 10);
-                        int64_t target_sample = (int64_t)(player.current_frame * player.samples_per_frame);
-                        player.target_audio_sample.store(target_sample);
-                        std::cout << "⏩ Frame " << player.current_frame << "\n";
-                        
-                        if (!player.max_fps_mode) {
-                            auto now = std::chrono::high_resolution_clock::now();
-                            double elapsed_frames = player.current_frame * player.frame_duration_ms;
-                            player.start_time = now - std::chrono::milliseconds((int)elapsed_frames);
+                        if (player.has_audio) {
+                            player.audio_sample_index = (int64_t)(player.current_frame * player.samples_per_frame);
+                            player.audio_frame_position.store(player.current_frame);
                         }
+                        std::cout << "⏩ Frame " << player.current_frame << "\n";
                         break;
                     }
                     
                     case SDLK_DOWN: {
                         player.current_frame = std::max(0, player.current_frame - 10);
-                        int64_t target_sample = (int64_t)(player.current_frame * player.samples_per_frame);
-                        player.target_audio_sample.store(target_sample);
-                        std::cout << "⏪ Frame " << player.current_frame << "\n";
-                        
-                        if (!player.max_fps_mode) {
-                            auto now = std::chrono::high_resolution_clock::now();
-                            double elapsed_frames = player.current_frame * player.frame_duration_ms;
-                            player.start_time = now - std::chrono::milliseconds((int)elapsed_frames);
+                        if (player.has_audio) {
+                            player.audio_sample_index = (int64_t)(player.current_frame * player.samples_per_frame);
+                            player.audio_frame_position.store(player.current_frame);
                         }
+                        std::cout << "⏪ Frame " << player.current_frame << "\n";
                         break;
                     }
                     
                     case SDLK_HOME: {
                         player.current_frame = 0;
-                        player.target_audio_sample.store(0);
-                        player.start_time = std::chrono::high_resolution_clock::now();
+                        if (player.has_audio) {
+                            player.audio_sample_index = 0;
+                            player.audio_frame_position.store(0);
+                        }
                         std::cout << "⏮️  Jump to start\n";
                         break;
                     }
                     
                     case SDLK_END: {
                         player.current_frame = player.header->total_frames - 1;
-                        int64_t target_sample = (int64_t)(player.current_frame * player.samples_per_frame);
-                        player.target_audio_sample.store(target_sample);
-                        
-                        if (!player.max_fps_mode) {
-                            auto now = std::chrono::high_resolution_clock::now();
-                            double elapsed_frames = player.current_frame * player.frame_duration_ms;
-                            player.start_time = now - std::chrono::milliseconds((int)elapsed_frames);
+                        if (player.has_audio) {
+                            player.audio_sample_index = (int64_t)(player.current_frame * player.samples_per_frame);
+                            player.audio_frame_position.store(player.current_frame);
                         }
                         std::cout << "⏭️  Jump to end\n";
                         break;
@@ -580,11 +496,10 @@ int main(int argc, char* argv[]) {
                     
                     case SDLK_r: {
                         player.current_frame = 0;
-                        player.target_audio_sample.store(0);
-                        player.audio_sample_pos = 0;
-                        player.start_time = std::chrono::high_resolution_clock::now();
-                        player.fps_timer = std::chrono::high_resolution_clock::now();
-                        player.frames_rendered = 0;
+                        if (player.has_audio) {
+                            player.audio_sample_index = 0;
+                            player.audio_frame_position.store(0);
+                        }
                         std::cout << "🔄 Restart\n";
                         break;
                     }
@@ -596,92 +511,61 @@ int main(int argc, char* argv[]) {
             }
         }
         
-        // 🎯 UPDATE FRAME
+        // 🎯 SYNC VIDEO TO AUDIO (AUDIO IS MASTER CLOCK!)
         if (player.playing) {
-            if (player.max_fps_mode) {
-                // 🔥🔥🔥 MAX FPS MODE - JUST BLAST THROUGH FRAMES!! 🔥🔥🔥
-                player.current_frame++;
+            if (player.has_audio) {
+                // Video follows audio - smooth and stable!
+                int64_t audio_frame = player.audio_frame_position.load();
+                player.current_frame = (int)audio_frame;
                 
                 if (player.current_frame >= (int)player.header->total_frames) {
                     player.current_frame = 0;
+                    player.audio_sample_index = 0;
+                    player.audio_frame_position.store(0);
                 }
-                
-                // Update audio target (it'll try its best lol)
-                int64_t target_sample = (int64_t)(player.current_frame * player.samples_per_frame);
-                player.target_audio_sample.store(target_sample);
-                
             } else {
-                // Normal timing mode
+                // No audio - advance frame based on FPS
+                static auto last_frame_time = std::chrono::high_resolution_clock::now();
                 auto now = std::chrono::high_resolution_clock::now();
-                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now - player.start_time
-                ).count();
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_frame_time).count();
                 
-                int target_frame = (int)(elapsed_ms / player.frame_duration_ms);
-                
-                if (target_frame != player.current_frame) {
-                    player.current_frame = target_frame;
-                    
-                    int64_t target_sample = (int64_t)(player.current_frame * player.samples_per_frame);
-                    player.target_audio_sample.store(target_sample);
-                    
+                double frame_time_ms = 1000.0 / player.header->fps;
+                if (elapsed >= frame_time_ms) {
+                    player.current_frame++;
                     if (player.current_frame >= (int)player.header->total_frames) {
                         player.current_frame = 0;
-                        player.start_time = now;
-                        player.target_audio_sample.store(0);
                     }
+                    last_frame_time = now;
                 }
             }
         }
         
-        // 🎨 RENDER - SKIP BOTH RENDERING AND SCREEN UPDATE IN ULTRA MODE!!
-        bool should_render_to_screen = !player.max_fps_mode || 
-                                       (player.current_frame % player.render_every_n_frames == 0);
-        
-        if (should_render_to_screen) {
-            if (!player.max_fps_mode && last_frame == player.current_frame) {
-                // Don't re-render same frame in normal mode
-            } else {
-                // 🔥 ULTRA FAST RENDERING!!
-                render_frame(screen_surface, player.current_frame);
-                SDL_UpdateWindowSurface(window);
-                last_frame = player.current_frame;
-            }
-        } else if (player.max_fps_mode) {
-            // 🚀 IN ULTRA MODE: Still "touch" the frame data to simulate processing
-            // but DON'T actually render it!! This keeps decompression cache warm
-            // and measures true frame processing speed!!
-            get_frame_data(player.current_frame);
-        }
-        
-        // 📊 FPS COUNTER - Always count frames processed!!
-        if (player.max_fps_mode) {
-            player.frames_rendered++;
-            
-            auto now = std::chrono::high_resolution_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - player.fps_timer
-            ).count();
-            
-            if (elapsed >= 1000) {
-                double actual_fps = (double)player.frames_rendered / (elapsed / 1000.0);
-                std::cout << "🔥🔥🔥 PROCESSING AT " << (int)actual_fps << " FPS!! ";
-                std::cout << "Frame " << player.current_frame << "/" << player.header->total_frames;
+        // 🎨 RENDER FRAME WITH GPU!! ONLY IF CHANGED!!
+        if (last_rendered_frame != player.current_frame) {
+            RGBA* frame_data = get_frame_data(player.current_frame);
+            if (frame_data) {
+                // 🔥🔥🔥 UPLOAD TO GPU TEXTURE - STREAMING FAST!! 🔥🔥🔥
+                void* pixels;
+                int pitch;
+                SDL_LockTexture(texture, nullptr, &pixels, &pitch);
                 
-                if (player.render_every_n_frames > 1) {
-                    std::cout << " 💨💨💨 (SCREEN UPDATE EVERY " << player.render_every_n_frames << " FRAMES)";
-                }
-                std::cout << "\n";
+                // Direct memcpy - ultra fast!!
+                memcpy(pixels, frame_data, 
+                       player.header->width * player.header->height * sizeof(RGBA));
                 
-                player.frames_rendered = 0;
-                player.fps_timer = now;
+                SDL_UnlockTexture(texture);
+                
+                // 🚀 GPU RENDER!! INSTANT!!
+                SDL_RenderClear(renderer);
+                SDL_RenderCopy(renderer, texture, nullptr, nullptr);
+                SDL_RenderPresent(renderer); // VSync automatically handles timing!
+                
+                last_rendered_frame = player.current_frame;
             }
         }
         
-        // Only delay in normal mode to prevent CPU melting
-        if (!player.max_fps_mode) {
-            SDL_Delay(1);
-        }
+        // Tiny sleep to prevent CPU spinning (VSync handles main timing)
+        SDL_Delay(1);
     }
     
     // Cleanup
@@ -691,12 +575,14 @@ int main(int argc, char* argv[]) {
         SDL_CloseAudioDevice(player.audio_device);
     }
     
+    SDL_DestroyTexture(texture);
+    SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();
     cleanup();
     
-    std::cout << "✨ Thanks for using HMIC-FAST CHAOS Player!! ✨\n";
-    std::cout << "🔥 SPEED IS LIFE!! 🔥\n";
+    std::cout << "✨ Thanks for using HMIC-FAST GPU Player!! ✨\n";
+    std::cout << "🔥 SMOOTH AS BUTTER!! 🔥\n";
     
     return 0;
 }
